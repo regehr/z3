@@ -23,37 +23,72 @@ Revision History:
 #include "util/util.h"
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <vector>
 
+struct pool_entry {
+  std::thread m_thread;
+  unsigned ms;
+  event_handler * eh;
+  std::timed_mutex m_mutex;
+  std::unique_lock<std::mutex> block;
+  std::condition_variable cv;
+};
+
+static std::vector<pool_entry *> free_threads;
+static std::mutex m;
+static int thread_cnt = 0;
 
 struct scoped_timer::imp {
 private:
-    std::thread      m_thread;
-    std::timed_mutex m_mutex;
+    pool_entry * pe;
 
-    static void thread_func(unsigned ms, event_handler * eh, std::timed_mutex * mutex) {
-        auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    static void thread_func(pool_entry *pe) {
+        while (1) {
+            auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(pe->ms);
 
-        while (!mutex->try_lock_until(end)) {
-            if (std::chrono::steady_clock::now() >= end) {
-                eh->operator()(TIMEOUT_EH_CALLER);
-                return;
+            while (!pe->m_mutex.try_lock_until(end)) {
+                if (std::chrono::steady_clock::now() >= end) {
+                    pe->eh->operator()(TIMEOUT_EH_CALLER);
+                    return;
+                }
             }
-        }
 
-        mutex->unlock();
+            pe->m_mutex.unlock();
+            pe->cv.wait(pe->block);
+        }
     }
 
 public:
     imp(unsigned ms, event_handler * eh) {
-        m_mutex.lock();
-        m_thread = std::thread(thread_func, ms, eh, &m_mutex);
+        m.lock();
+        if (free_threads.empty()) {
+          pe = new pool_entry { std::thread(), ms, eh };
+          if (1) {
+            thread_cnt++;
+            std::cerr << "created a new thread, there are " << thread_cnt << " now\n";
+          }
+          m.unlock();
+          pe->m_mutex.lock();
+          pe->m_thread = std::thread(thread_func, pe);
+        } else {
+          pe = free_threads.back();
+          free_threads.pop_back();
+          m.unlock();
+          pe->ms = ms;
+          pe->eh = eh;
+          pe->m_mutex.lock();
+          pe->cv.notify_one();
+        }
     }
 
     ~imp() {
-        m_mutex.unlock();
-        m_thread.join();
+      pe->m_mutex.unlock();
+      m.lock();
+      free_threads.push_back(pe);
+      m.unlock();
     }
 };
 
